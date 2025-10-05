@@ -1,0 +1,273 @@
+import os
+import io
+import uuid
+import logging
+from datetime import datetime
+import pytz
+
+from flask import (
+    Flask, render_template, request, redirect, url_for, flash,
+    send_from_directory, send_file
+)
+from werkzeug.utils import secure_filename
+from pymongo import MongoClient
+from pymongo.errors import PyMongoError
+import pandas as pd
+from dotenv import load_dotenv
+
+# PDF library
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib import colors
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet
+
+# -------------------------
+# Config / Logging
+# -------------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+load_dotenv()
+
+# -------------------------
+# App and folders
+# -------------------------
+app = Flask(__name__)
+app.secret_key = os.getenv('SECRET_KEY', 'dev')
+
+UPLOAD_FOLDER = 'uploads'
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+
+SAMPLE_DIR = os.path.join(app.root_path, 'static', 'files')
+os.makedirs(SAMPLE_DIR, exist_ok=True)
+
+SAMPLE_FILENAME = 'sample_template.csv'
+SAMPLE_PATH = os.path.join(SAMPLE_DIR, SAMPLE_FILENAME)
+if not os.path.exists(SAMPLE_PATH):
+    with open(SAMPLE_PATH, 'w', newline='') as f:
+        f.write("student_id,name,Statistics,BigDataAnalytics\n")
+        f.write("101,John Doe,85,90\n")
+        f.write("102,Jane Smith,78,88\n")
+    logger.info("Created sample CSV template at %s", SAMPLE_PATH)
+
+ALLOWED_EXTENSIONS = {'csv'}
+
+# -------------------------
+# MongoDB setup
+# -------------------------
+MONGO_URI = os.getenv('MONGO_URI', 'mongodb://localhost:27017')
+MONGO_DB = os.getenv('MONGO_DB', 'school')
+MONGO_COLLECTION = os.getenv('MONGO_COLLECTION', 'students')
+
+logger.info("Mongo settings -> URI: %s DB: %s COLLECTION: %s",
+            MONGO_URI if 'password' not in (MONGO_URI or '') else 'mongodb://<hidden>',
+            MONGO_DB, MONGO_COLLECTION)
+
+client = None
+db = None
+collection = None
+try:
+    client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+    client.admin.command('ping')
+    db = client[MONGO_DB]
+    collection = db[MONGO_COLLECTION]
+    logger.info("Connected to MongoDB successfully.")
+except Exception as e:
+    logger.exception("Failed to connect to MongoDB: %s", e)
+    collection = None
+
+# -------------------------
+# Helper functions
+# -------------------------
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+def compute_pass_fail(student_row):
+    try:
+        c1 = float(student_row.get('Statistics', 0))
+        c2 = float(student_row.get('BigDataAnalytics', 0))
+    except Exception:
+        return 'Fail'
+    return 'Pass' if c1 >= 40 and c2 >= 40 else 'Fail'
+
+
+def validate_row(row, row_number):
+    errors = []
+    sid = str(row.get('student_id', '')).strip()
+    if sid == '' or sid.lower() == 'nan':
+        errors.append(f"Row {row_number}: 'student_id' is missing or empty.")
+    name = str(row.get('name', '')).strip()
+    if name == '' or name.lower() == 'nan':
+        errors.append(f"Row {row_number}: 'name' is missing or empty.")
+    for course in ('Statistics', 'BigDataAnalytics'):
+        val = row.get(course, None)
+        try:
+            v = float(val)
+            if v < 0 or v > 100:
+                errors.append(f"Row {row_number}: '{course}' value {v} out of range (0-100).")
+        except Exception:
+            errors.append(f"Row {row_number}: '{course}' is not a valid number.")
+    return errors
+
+# -------------------------
+# Routes
+# -------------------------
+@app.route('/')
+def index():
+    return render_template('functionality.html')
+
+
+@app.route('/download-template')
+def download_template():
+    template_folder = os.path.join(app.root_path, 'static', 'files')
+    return send_from_directory(template_folder, SAMPLE_FILENAME, as_attachment=True)
+
+
+@app.route('/upload', methods=['POST'])
+def upload_file():
+    if collection is None:
+        flash("Server error: cannot connect to database. Check server and MONGO_URI.", "error")
+        return redirect(url_for('index'))
+
+    if 'file' not in request.files:
+        flash('No file part', 'error')
+        return redirect(request.url)
+    file = request.files['file']
+    if file.filename == '':
+        flash('No selected file', 'error')
+        return redirect(request.url)
+    if file and allowed_file(file.filename):
+        filename = secure_filename(file.filename)
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(filepath)
+
+        try:
+            try:
+                df = pd.read_csv(filepath, encoding='utf-8')
+            except Exception:
+                df = pd.read_csv(filepath, encoding='latin1')
+        except Exception as e:
+            logger.exception("Error reading CSV: %s", e)
+            flash(f"Error reading CSV: {str(e)}", "error")
+            return redirect(url_for('index'))
+
+        if df.columns.size == 0:
+            flash("Uploaded CSV has no columns or is invalid. Please check the file.", "error")
+            return redirect(url_for('index'))
+
+        errors = []
+        for i, row in df.iterrows():
+            row_errors = validate_row(row, i + 1)
+            if row_errors:
+                errors.extend(row_errors)
+
+        if errors:
+            return render_template('result.html', results=None, errors=errors)
+
+        upload_id = str(uuid.uuid4())
+        upload_time = datetime.utcnow()
+
+        results = []
+        for i, row in df.iterrows():
+            try:
+                student = {
+                    "student_id": row['student_id'],
+                    "name": row['name'],
+                    "Statistics": float(row['Statistics']),
+                    "BigDataAnalytics": float(row['BigDataAnalytics']),
+                    "result": compute_pass_fail(row),
+                    "upload_id": upload_id,
+                    "upload_time": upload_time
+                }
+            except Exception as e:
+                logger.exception("Row parsing error for row %s: %s", i+1, e)
+                errors.append(f"Row {i+1}: parsing error: {e}")
+                continue
+
+            try:
+                res = collection.insert_one(student)
+                logger.info("Inserted student %s -> _id: %s", student.get('student_id'), res.inserted_id)
+                results.append(student)
+            except PyMongoError as e:
+                logger.exception("Failed to insert student %s: %s", student.get('student_id'), e)
+                errors.append(f"DB insert error for row {i+1}: {e}")
+
+        if errors:
+            return render_template('result.html', results=results if results else None, errors=errors)
+
+        flash('✅ CSV file uploaded successfully and processed!', 'success')
+        return render_template('result.html', results=results, errors=None, upload_id=upload_id)
+
+    flash('Allowed file types are csv', 'error')
+    return redirect(url_for('index'))
+
+
+@app.route('/download-pdf/<upload_id>')
+def download_pdf(upload_id):
+    if collection is None:
+        flash("Server error: cannot connect to database. Check server and MONGO_URI.", "error")
+        return redirect(url_for('index'))
+
+    docs = list(collection.find({"upload_id": upload_id}))
+    if not docs:
+        flash("No results found for this upload.", "error")
+        return redirect(url_for('index'))
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=landscape(A4), rightMargin=15, leftMargin=15, topMargin=20, bottomMargin=20)
+    styles = getSampleStyleSheet()
+    elements = []
+
+    # Improved header with local time
+    upload_time = docs[0].get('upload_time')
+    uploaded_str = ""
+    if upload_time:
+        local_tz = pytz.timezone("Asia/Kolkata")
+        uploaded_local = upload_time.replace(tzinfo=pytz.utc).astimezone(local_tz)
+        uploaded_str = uploaded_local.strftime("%Y-%m-%d %I:%M %p")
+
+    header_text = f"📄 Student Result Report"
+    meta_text = f"Uploaded at: {uploaded_str}"
+
+    header = Paragraph(header_text, styles['Title'])
+    elements.append(header)
+    elements.append(Spacer(1, 4))
+    elements.append(Paragraph(meta_text, styles['Normal']))
+    elements.append(Spacer(1, 12))
+
+    table_data = [["Student ID", "Name", "Statistics", "Big Data Analytics", "Result"]]
+    for d in docs:
+        table_data.append([
+            d.get("student_id", ""),
+            d.get("name", ""),
+            d.get("Statistics", ""),
+            d.get("BigDataAnalytics", ""),
+            d.get("result", "")
+        ])
+
+    table = Table(table_data, repeatRows=1)
+    table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#4CAF50")),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor("#f9f9f9")]),
+    ]))
+
+    elements.append(table)
+    doc.build(elements)
+
+    buffer.seek(0)
+    filename = f"results_{upload_id}.pdf"
+    return send_file(buffer, as_attachment=True, download_name=filename, mimetype='application/pdf')
+
+
+# -------------------------
+# Run App
+# -------------------------
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)
